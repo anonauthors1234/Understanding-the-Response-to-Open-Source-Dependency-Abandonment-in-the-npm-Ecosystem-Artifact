@@ -1,0 +1,718 @@
+---
+title: "Replication Script"
+output: html_notebook
+---
+
+
+```{r}
+# importing libraries 
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(survival)
+library(survminer)
+library(car)
+library(pscl)
+```
+
+
+# Loading Data
+
+```{r}
+# importing dataset with all widely-used npm packages identified, including abnaonded ones
+widelyUsednpmPackages <- read_csv("data/widelyUsednpmPackages.csv")
+
+
+# importing dataset of dependents exposed to abandonment 
+abandonmentExposedDependentsData <- read_csv("data/abandonmentExposedDependentsData.csv")
+
+# importing dataset of exposed dependents for R21b baseline comparison
+updateExposedDependentsData <- read_csv("data/updateExposedDependentsData.csv")
+#updateExposedDependentsData <- read_csv("data/rq1bDependentData.csv")
+
+# importing dataset of exposed dependents for RQ2c baseline comparison
+vulnerabilityExposedDependentsData <- read_csv("data/vulnerabilityExposedDependentsData.csv")
+```
+
+# Data Set Up
+
+Run these chunks to cast all the appropriate variables to the types they should be, and to create status and time vars for modeling 
+
+Abandoned dependents dataset setup
+```{r}
+## ABANDONED DEPENDENTS DATASET
+
+# creating status vars (response representing whether dependent repo removed abandoned dependency)
+## statusEver - whether the dependent project ever responded to event of interest (as of Sept-2023)
+abandonmentExposedDependentsData <- abandonmentExposedDependentsData %>% mutate(statusEver = ifelse(is.na(monthsFromAbandonmentToRemoval), 0, 1))
+## status2Yr - whether the dependent project responded to event of interest within two years of event occurrence (used in log reg model)
+abandonmentExposedDependentsData <- abandonmentExposedDependentsData %>% mutate(status2Yr = ifelse(is.na(monthsFromAbandonmentToRemoval), 0, ifelse(monthsFromAbandonmentToRemoval <= 24, 1, 0))) 
+# casting status vars to factor
+abandonmentExposedDependentsData$status2Yr <- as.factor(abandonmentExposedDependentsData$status2Yr)
+#abandonmentExposedDependentsData$statusEver <- as.factor(abandonmentExposedDependentsData$statusEver)
+abandonmentExposedDependentsData$statusSurv <- as.numeric(abandonmentExposedDependentsData$statusEver)
+# adding flag
+abandonmentExposedDependentsData <- abandonmentExposedDependentsData %>% mutate(depType = "depAbandonment")
+
+str(abandonmentExposedDependentsData)
+# Casting necessary vars to correct type
+abandonmentExposedDependentsData$usesDepManagementTools <- as.logical(abandonmentExposedDependentsData$useDepManagementTools)
+
+abandonmentExposedDependentsData$abandonmentTypeBinary <- as.factor(abandonmentExposedDependentsData$abandonmentTypeBinary)
+
+abandonmentExposedDependentsData$detection <- abandonmentExposedDependentsData$abandonmentTypeBinary
+levels(abandonmentExposedDependentsData$detection) <- c("ActivityBased", "ExplicitNotice")
+
+abandonmentExposedDependentsData$latestCommit <- as.Date(abandonmentExposedDependentsData$latestCommit,format="%m/%d/%y")
+abandonmentExposedDependentsData$depAbandonedAt <- as.Date(abandonmentExposedDependentsData$depAbandonedAt,format="%m/%d/%y")
+
+
+# creating time var (months to response or censorship)
+
+# if dep was removed then time = time to removal. if the dependency was not removed, then check to see if the dependency's latest commit happened before the end of the observation period ("2023-09-01): if so, then time is diff b/w abandonment date and time of latest commit (since that's when they became inactive ie censored), and else time is diff b/w abandonment date and end of observation period ("2023-09-01")
+abandonmentExposedDependentsData <- abandonmentExposedDependentsData %>% mutate(monthsToResponseOrCensored = ifelse(!is.na(monthsFromAbandonmentToRemoval),monthsFromAbandonmentToRemoval,ifelse(latestCommit < "2023-09-01", interval(depAbandonedAt, latestCommit) %/% months(1), interval(depAbandonedAt, "2023-09-01") %/% months(1))))
+```
+
+
+update dependents dataset setup
+```{r}
+# casting vars to appropriate types
+# converting time vars to datetime
+updateExposedDependentsData$versionRemovedDateTime <- as_datetime(paste0(updateExposedDependentsData$versionRemovedDateTime), format = "%Y-%m-%d %H:%M:%S")
+updateExposedDependentsData$dependencyVOIDateTime <- as_datetime(paste0(updateExposedDependentsData$dependencyVOIDateTime), format =  "%Y-%m-%d %H:%M:%S")
+updateExposedDependentsData$latestCommit <- as.Date(updateExposedDependentsData$latestCommit, format =  "%Y-%m-%d")
+
+# creating time var (months to response or censorship)
+# time: if it was updated then time=update lag in months, elif: dependency was removed then time= diff(VOIDateTime, removal date), elif the dependency's latest commit happened before the end of the observation period ("2023-09-01): if so, then time is diff b/w abandonment date and time of latest commit, and else time is diff b/w abandonment date and end of observation period ("2023-09-01")
+updateExposedDependentsData <- updateExposedDependentsData %>%  mutate(monthsToResponseOrCensored = ifelse(updateLagMonths != -1,updateLagMonths, ifelse(!is.na(versionRemovedDateTime), interval(dependencyVOIDateTime, versionRemovedDateTime) %/% months(1), ifelse(latestCommit < "2023-09-01", interval(dependencyVOIDateTime, latestCommit) %/% months(1), interval(dependencyVOIDateTime, "2023-09-01") %/% months(1)))))
+
+# creating status var, where status = 1 if repo upgraded the dep and 0 if it didn't 
+updateExposedDependentsData <- updateExposedDependentsData %>% mutate(statusEver = ifelse(updateLagHrs == -1, 0, 1))
+# adding flag 
+updateExposedDependentsData <- updateExposedDependentsData %>% mutate(depType = "depUpdate")
+updateExposedDependentsData <- updateExposedDependentsData %>% mutate(abandonmentTypeBinary = "depUpdate")
+```
+
+
+
+vulnerability dependents dataset setup
+```{r}
+# casting time vars to datetime
+vulnerabilityExposedDependentsData$versionRemovedDateTime <- as_datetime(paste0(vulnerabilityExposedDependentsData$versionRemovedDateTime), format = "%Y-%m-%d %H:%M:%S")
+vulnerabilityExposedDependentsData$patchVersionDateTime <- as_datetime(paste0(vulnerabilityExposedDependentsData$patchVersionDateTime), format =  "%Y-%m-%d %H:%M:%S")
+vulnerabilityExposedDependentsData$latestCommit <- as.Date(vulnerabilityExposedDependentsData$latestCommit, format =  "%Y-%m-%d")
+
+# creating time var (months to response or censorship)
+# time: if it was updated then time=update lag in months, elif: dependency was removed then time= diff(VOIDateTime, removal date), elif the dependency's latest commit happened before the end of the observation period ("2023-09-01): if so, then time is diff b/w abandonment date and time of latest commit, and else time is diff b/w abandonment date and end of observation period ("2023-09-01")
+vulnerabilityExposedDependentsData <- vulnerabilityExposedDependentsData %>%  mutate(monthsToResponseOrCensored = ifelse(updateLagMonths != -1,updateLagMonths, ifelse(!is.na(versionRemovedDateTime), interval(patchVersionDateTime, versionRemovedDateTime) %/% months(1), ifelse(latestCommit < "2023-09-01", interval(patchVersionDateTime, latestCommit) %/% months(1), interval(patchVersionDateTime, "2023-09-01") %/% months(1)))))
+
+# creating status var, where status = 1 if repo upgraded the dep and 0 if it didn't 
+vulnerabilityExposedDependentsData <- vulnerabilityExposedDependentsData %>% mutate(statusEver = ifelse(updateLagHrs == -1, 0, 1))
+
+# adding flags
+vulnerabilityExposedDependentsData <- vulnerabilityExposedDependentsData %>% mutate(depType = "depSecurityPatch")
+vulnerabilityExposedDependentsData <- vulnerabilityExposedDependentsData %>% mutate(abandonmentTypeBinary = "depSecurityPatch")
+```
+
+
+
+
+
+
+
+# RQ1 
+
+
+## Comparing characteristics of abandoned vs non-abandoned widely-used packages
+
+Density plot comparing peak download and current star count (as of March 2024) distribution for abandoned vs non-abandoned widely used packages
+```{r}
+widelyUsedProjectPeakDownloadDensityPlot <- ggplot(widelyUsednpmPackages, aes(x=maxNumDownloads, fill = as.factor(isAbandoned), color = as.factor(isAbandoned))) + 
+ geom_density(alpha=.1, lwd = .5) + theme_classic() + theme(legend.position = c(0.6,0.9))  + theme(text = element_text(size = 17), axis.text.y = element_text(size = 12), axis.text.x = element_text(size = 12,angle = 15, vjust = 1, hjust=1), legend.position = "none") + scale_x_continuous(trans='log10', labels = scales::comma) + labs(x = "peak num downloads", y = "pkg. density")  + scale_fill_manual(name='', labels=c('non-abandoned','abandoned'),values=c("#00A08A","#F2AD00")) + scale_color_manual(name='', labels=c('non-abandoned','abandoned'),values=c("#00A08A","#F2AD00")) 
+
+
+widelyUsedProjectStartCountDensityPlot <- ggplot(widelyUsednpmPackages, aes(x=numStars, fill = as.factor(isAbandoned), color = as.factor(isAbandoned))) + 
+ geom_density(alpha=.1, lwd = .5) + theme_classic() + theme(legend.position = c(0.8,0.9))  + theme(text = element_text(size = 17), axis.text.y = element_text(size = 12), axis.text.x = element_text(size = 12),legend.direction = "vertical", legend.text = element_text(size = 10)) + scale_x_continuous(trans='log10', labels = scales::comma) + labs(x = "num stars", y = "pkg. density")  + scale_fill_manual(name='', labels=c('non-abandoned','abandoned'),values=c("#00A08A","#F2AD00")) + scale_color_manual(name='', labels=c('non-abandoned','abandoned'),values=c("#00A08A","#F2AD00")) 
+
+
+# combining plots together 
+# printing plot with barchart and boxplot for overall distributon of time to removal 
+all <- ggarrange(widelyUsedProjectPeakDownloadDensityPlot,widelyUsedProjectStartCountDensityPlot, nrow = 1, ncol=2 )
+
+ggsave("visualizations/widelyUsedProjectStarAndDownloadDensityPlots.pdf",all, width =9, height=3, units="in")
+
+```
+
+
+## Looking at exposed dependents
+
+```{r}
+
+
+# making binned star counts where 1-10 are grouped together 
+abandonmentExposedDependentsData <- abandonmentExposedDependentsData %>% mutate(numStarsCurrentBinned = ifelse(numStarsCurrent == 0, "0", ifelse(numStarsCurrent < 11, "1-10", ifelse(numStarsCurrent < 21, "11-20", ifelse(numStarsCurrent < 31, "21-30", ifelse(numStarsCurrent < 41, "31-40", ifelse(numStarsCurrent < 51, "41-50", ifelse(numStarsCurrent < 61, "51-60", ifelse(numStarsCurrent < 71, "61-70", ifelse(numStarsCurrent < 81, "71-80", ifelse(numStarsCurrent < 91, "81-90", ifelse(numStarsCurrent < 101, "91-100","101+"))))))))))))
+# setting order of binned counts 
+abandonmentExposedDependentsData$numStarsCurrentBinned <- factor(abandonmentExposedDependentsData$numStarsCurrentBinned, levels = c('0','1-10','11-20','21-30','31-40','41-50','51-60','61-70','71-80','81-90','91-100','101+'))
+
+
+# binned histogram of num stars distribution for dependent projects 
+ggplot(abandonmentExposedDependentsData, aes(x = numStarsCurrentBinned)) + geom_histogram(fill = "#00A08A",stat='count') + theme_classic() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), text = element_text(size = 20)) + labs(x = "star count", y = "num projects")
+
+
+ggplot(widelyUsednpmPackages, aes(x=numStars, fill = as.factor(isAbandoned), color = as.factor(isAbandoned))) + 
+ geom_density(alpha=.1, lwd = .5) + theme_classic() + theme(legend.position = c(0.7,0.9))  + theme(text = element_text(size = 17), axis.text.y = element_text(size = 12), axis.text.x = element_text(size = 12), legend.position="none") + scale_x_continuous(trans='log10', labels = scales::comma) + labs(x = "num stars", y = "density")  + scale_fill_manual(name='', labels=c('non-abandoned packages','abandoned packages'),values=c("#00A08A","#F2AD00")) + scale_color_manual(name='', labels=c('non-abandoned packages','abandoned packages'),values=c("#00A08A","#F2AD00")) 
+
+
+
+# distribution of star count of projects exposed to abandonemnt
+
+depProjStarDensityPlot <- ggplot(abandonmentExposedDependentsData, aes(x=numStarsCurrent)) + 
+ geom_density(alpha=.1, lwd = .5, color = "#00A08A", fill = "#00A08A")  + scale_x_continuous(trans='log10', labels = scales::comma) + theme_classic() +  theme(text = element_text(size = 17), axis.text.y = element_text(size = 12), axis.text.x = element_text(size = 12)) + labs(x = "num stars", y = "density")
+
+ggsave("visualizations/depProjStarDensityPlot.pdf",depProjStarDensityPlot, width =9, height=3, units="in")
+```
+
+
+
+
+
+
+# RQ2 
+
+
+Creating combined dataset with data from abandonment, update, and vulnerability dependent projects
+```{r}
+## combining datasets 
+comboCoxData <- rbind(abandonmentExposedDependentsData %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary), updateExposedDependentsData %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary), vulnerabilityExposedDependentsData %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary))
+
+
+comboCoxData$abandonmentTypeBinary <- factor(comboCoxData$abandonmentTypeBinary, levels=c('activity-based', 'explicit-notice', 'depUpdate', 'depSecurityPatch'))
+comboCoxData$depType <- factor(comboCoxData$depType, levels=c('depAbandonment', 'depUpdate', 'depSecurityPatch'))
+```
+
+
+
+building survival curve with floating dependencies 
+```{r}
+# building survival curve 
+surv_object <- Surv(time = comboCoxData$monthsToResponseOrCensored, event = comboCoxData$statusEver)
+fit <- survfit(surv_object ~ depType, data = comboCoxData)
+
+# plotting kaplan-meier survival curve
+survivalCurveWFloating <- ggsurvplot(fit, data = comboCoxData, legend.title = "",legend.labs = c('Abandonment', 'Update', 'Security Patch'),palette = c("#00A08A", "#F2AD00","#FF0000"),ggtheme = theme_classic(),conf.int = TRUE,pval = FALSE,conf.int.alpha = 0.1, font.x = c(15), font.y = c(15), font.tickslab = c(13), censor = FALSE, xlab = "Delay (In Months)", ylab = "Survival Probability", legend = c(0.85,0.92), font.legend = c(15), font.legend.title = c(15), xlim = c(0, 75)) 
+survivalCurveWFloating
+
+ggsave("visualizations/survivalCurveWFloating.pdf",survivalCurveWFloating$plot, width =9, height=3, units="in")
+```
+
+
+
+
+excluding floating dependents for baseline comparisons that were able to automatically update
+
+```{r}
+## excluding dependents with floating baseline versions that were able to automatically update (judged by determining if their update lag in hours was 0)
+updateExposedDependentsDataNoAuto <- updateExposedDependentsData %>% filter((baselineVersionFloating == "FALSE") | (baselineVersionFloating == "TRUE" & updateLagHrs != 0))
+vulnerabilityExposedDependentsDataNoAuto <- vulnerabilityExposedDependentsData %>% filter((baselineVersionFloating == "FALSE") | (baselineVersionFloating == "TRUE" & updateLagHrs != 0))
+
+# combining datasets 
+comboCoxDataNoAuto <- rbind(abandonmentExposedDependentsData %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary), updateExposedDependentsDataNoAuto %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary), vulnerabilityExposedDependentsDataNoAuto %>% dplyr::select(dependency,repo,statusEver,monthsToResponseOrCensored,depType,abandonmentTypeBinary))
+
+comboCoxDataNoAuto$abandonmentTypeBinary <- factor(comboCoxDataNoAuto$abandonmentTypeBinary, levels=c('activity-based', 'explicit-notice', 'depUpdate', 'depSecurityPatch'))
+comboCoxDataNoAuto$depType <- factor(comboCoxDataNoAuto$depType, levels=c('depAbandonment', 'depUpdate', 'depSecurityPatch'))
+```
+
+
+
+building survival curve 
+
+```{r}
+# building survival curve 
+surv_objectNoAuto <- Surv(time = comboCoxDataNoAuto$monthsToResponseOrCensored, event = comboCoxDataNoAuto$statusEver)
+fitNoAuto <- survfit(surv_objectNoAuto ~ depType, data = comboCoxDataNoAuto)
+
+# plotting kaplan-meier survival curve
+survivalCurveWBaselines <- ggsurvplot(fitNoAuto, data = comboCoxDataNoAuto, legend.title = "",legend.labs = c('Abandonment', 'Update', 'Security Patch'),palette = c("#00A08A", "#F2AD00","#FF0000"),ggtheme = theme_classic(),conf.int = TRUE,pval = FALSE,conf.int.alpha = 0.1, font.x = c(15), font.y = c(15), font.tickslab = c(13), censor = FALSE, xlab = "Delay (In Months)", ylab = "Survival Probability", legend = c(0.12,0.28), font.legend = c(15), font.legend.title = c(), xlim = c(0, 75)) 
+survivalCurveWBaselines
+
+ggsave("visualizations/survivalCurveWithBaselinesWithCI.pdf",survivalCurveWBaselines$plot, width =9, height=3, units="in")
+```
+
+
+
+
+
+# RQ3/ RQ4
+
+## Data Prep/Clean up 
+
+### Inspect the distributions of each variable, look for outliers
+
+```{r}
+
+# creating data set for modeling
+modelingDataRaw <- abandonmentExposedDependentsData
+
+
+# Repo age (in months)
+# Looking at the distribution of the repo age var
+ggplot(modelingDataRaw, aes(x = repoAgeAtAbandonment, fill = status2Yr)) + 
+  geom_histogram() +
+  scale_x_log10()
+# We could log this var
+summary(modelingDataRaw$repoAgeAtAbandonment)
+# The distribution looks pretty reasonable, no significant outliers 
+ggplot(modelingDataRaw, aes(x=status2Yr, y=repoAgeAtAbandonment, col=status2Yr)) +
+  geom_boxplot()
+# It looks like the repos that remove the dependency are about as old as the 
+# repos that don't remove the dependency
+
+
+# Repo size 
+# Looking at the distribution
+summary(modelingDataRaw$repoSize)
+# Exclude the 5 repos we couldn't clone (their size is -1)
+modelingDataRaw <- modelingDataRaw %>% filter(repoSize != -1)
+ggplot(modelingDataRaw, aes(x = repoSize, fill = status2Yr)) + 
+  geom_histogram() +
+  scale_x_log10()
+# We should log this var
+
+
+# Num dependencies
+summary(modelingDataRaw$totalNumDependencies)
+table(modelingDataRaw$totalNumDependencies)
+# It looks like there's one outlier that has 22750 dependencies
+# Exclude row that has outlier 
+modelingDataRaw <- modelingDataRaw %>% filter(totalNumDependencies < 20000)
+# Comparing distribution of num dependencies based on status2Yr
+ggplot(modelingDataRaw, aes(x = totalNumDependencies, fill = status2Yr)) + 
+  geom_histogram()
+ggplot(modelingDataRaw, aes(x=status2Yr, y=totalNumDependencies, col=status2Yr)) +
+  geom_boxplot() +
+  scale_y_log10()
+# Not much difference in size between repos who remove and who don't
+# We should log this var
+
+
+# Dependency churn 
+# looking at the distribution of var 
+summary(modelingDataRaw$totalDependencyChurn)
+table(modelingDataRaw$totalDependencyChurn == 0)
+# The distribution seems bimodal, with lots of projects not updating any 
+# dependencies. Maybe we need a flag here
+modelingDataRaw$hasDependencyChurn <- modelingDataRaw$totalDependencyChurn > 0
+# Safe to ignore a few outliers with tons of churn
+modelingDataRaw <- modelingDataRaw %>% filter(totalDependencyChurn < 1000)
+
+
+# Use of dependency management tools
+# looking at distribution of variable
+table(modelingDataRaw$useDepManagementTools)
+  ## the majority of dependent repos didn't use dependency management tools
+# looking at distribution of use of dependency management tools by staus
+ggplot(modelingDataRaw, aes(x = useDepManagementTools, fill = status2Yr)) + 
+  geom_histogram(, stat="count")
+
+
+# Activity (num commits)
+# looking at the distribution of var 
+summary(modelingDataRaw$numCommits)
+# comparing distribution of num commits based on status2Yr
+ggplot(modelingDataRaw, aes(x=status2Yr, y=numCommits, col=status2Yr)) +
+  geom_boxplot() +
+  scale_y_log10()
+# Repos who remove are more active
+# We should log this var, a flag may be useful too
+modelingDataRaw$hasCommits <- modelingDataRaw$numCommits > 0
+
+
+# num corporate commits (proxy for comercial involvement)
+# looking at the distribution of var 
+summary(modelingDataRaw$numCorporateCommits)
+# Mostly zeros
+table(modelingDataRaw$numCorporateCommits > 0)
+# there are only 17 dependent repos that had any corporate commits
+# Use a flag
+modelingDataRaw$hasCorporateCommits <- modelingDataRaw$numCorporateCommits > 0
+
+# Num maintainers 
+# looking at the distribution of var 
+summary(modelingDataRaw$numMaintainers)
+# This follows the distro for numCommits
+# We can filter out numMaintainers > 12
+modelingDataRaw <- modelingDataRaw %>% filter(numMaintainers <= 12)
+modelingDataRaw$hasMaintainers <- modelingDataRaw$numMaintainers > 0
+
+
+# Technical lag
+# looking at the distribution of var 
+summary(modelingDataRaw$avgTechnicalLagDays)
+# Exclude the 6 cases we couldn't calculate technical lag
+modelingDataRaw <- modelingDataRaw %>%
+  filter(avgTechnicalLagDays >= 0) # & avgTechnicalLagDays <= 1000)
+
+ggplot(modelingDataRaw, aes(x = avgTechnicalLagDays, fill = status2Yr)) + 
+  geom_histogram()
+# comparing distribution of avg technical lag based on status2Yr
+ggplot(modelingDataRaw,
+       aes(x = status2Yr, y = avgTechnicalLagDays + 1, col = status2Yr)) +
+  geom_boxplot() +
+  scale_y_log10()
+  # technical lag seems to be higher among repos that don't remove dependency
+# We should log this variable
+
+
+
+# Issue response lag
+hist(modelingDataRaw$numIssuesOpened)
+table(modelingDataRaw$numIssuesOpened == 0)
+  ## most repos (746/960) had no issues opened the year before abandonment
+modelingDataRaw$hasIssuesOpened <- modelingDataRaw$numIssuesOpened > 0
+
+table(modelingDataRaw$numIssuesClosed)
+
+
+# Project maturity variables
+
+# Counts number of governance and organizational files 
+modelingDataRaw <- modelingDataRaw %>%
+  mutate(numGovOrgFiles = rowSums(across(
+    c(hasContributing, hasCoC, hasLicense, 
+      hasIssueTemplate, hasPRTemplate, hasREADME))))
+hist(modelingDataRaw$numGovOrgFiles)
+table(modelingDataRaw$numGovOrgFiles)
+
+# Binary flag representing whether each repo had 2+ govOrgFiles
+modelingDataRaw <- modelingDataRaw %>%
+  mutate(repoMature = ifelse(numGovOrgFiles >= 2, TRUE, FALSE))
+table(modelingDataRaw$repoMature)
+
+# Casting all the binary flags as factors
+modelingDataRaw$hasCoC <- as.logical(modelingDataRaw$hasCoC)
+modelingDataRaw$hasContributing <- as.logical(modelingDataRaw$hasContributing)
+modelingDataRaw$hasLicense <- as.logical(modelingDataRaw$hasLicense)
+modelingDataRaw$hasIssueTemplate <- as.logical(modelingDataRaw$hasIssueTemplate)
+modelingDataRaw$hasPRTemplate <- as.logical(modelingDataRaw$hasPRTemplate)
+modelingDataRaw$hasREADME <- as.logical(modelingDataRaw$hasREADME)
+
+
+table(modelingDataRaw$hasCoC)
+  # 25 repos have CoC
+table(modelingDataRaw$hasContributing)
+  # 118 repos have contributing docs  
+table(modelingDataRaw$hasLicense)
+  # 436 repos have license  
+table(modelingDataRaw$hasIssueTemplate)
+  # 51 repos have issueTemplate
+table(modelingDataRaw$hasPRTemplate)
+  # 39 repos have PR template
+table(modelingDataRaw$hasREADME)
+  # 839 repos have README
+table(modelingDataRaw$numREADMEHeaders)
+# comparing distribution of README headers based on status2Yr
+ggplot(modelingDataRaw, aes(x=status2Yr, y=numREADMEHeaders, col=status2Yr)) +
+  geom_boxplot()
+table(modelingDataRaw$numREADMEHeaders)
+
+# seeing how many projects have one of the other files but not README
+modelingDataRaw %>%
+  filter((hasCoC == 1 |
+            hasContributing == 1 |
+            hasLicense == 1 |
+            hasIssueTemplate == 1 |
+            hasPRTemplate== 1) &
+           hasREADME == 0)
+# there are only 23 projects that have one of the other files but not README
+```
+
+### Factor analysis on the governance-related variables
+
+Start with the "traditional" approach (not appropriate here since the data
+are binary), for reference.
+
+```{r}
+# Pick the variables we need
+modelingDataGov <- as.data.frame(
+  sapply(modelingDataRaw[,c("hasCoC", "hasContributing", "hasLicense",
+                     "hasIssueTemplate", "hasPRTemplate", "hasREADME")], 
+  as.numeric))
+
+# Convert to factors and compute polychoric correlations
+library(polycor)
+library(psych)
+cor_governance <- hetcor(as.data.frame(sapply(modelingDataGov, as.factor)))$cor
+round(cor_governance, 2)
+# looks like everything except README is correlated with each other,
+# suggesting two factors
+
+# Scree plot to determine number of factors
+fa.parallel(modelingDataGov) # confirms two
+
+# Factor analysis with 2 factors
+efa_2 <- fa(r = cor_governance, 
+            nfactors = 2, 
+            # covar = FALSE, SMC = TRUE,
+            # n.obs = nrow(modelingDataGov), 
+              fm = "ml", # type of factor analysis we want to use (“pa” is principal axis factoring)
+              max.iter = 100, # (50 is the default, but we have changed it to 100
+              rotate = "varimax") # none rotation
+
+efa_2
+efa_2$loadings
+
+
+# # Use the loadings to create new variables
+# scores <- data.frame(factor.scores(modelingDataGov, efa_2)$scores)
+# names(scores) <- c("governanceFiles", "governanceReadme")
+# modelingDataRaw <- cbind(modelingDataRaw, scores)
+# names(modelingDataRaw)
+
+```
+Now estimate the latent trait model, the analogue of the factor analysis model 
+for binary observed data.
+
+```{r}
+
+paste2 <- function(multi.columns, sep=".", handle.na=TRUE, trim=TRUE){
+    if (trim) multi.columns <- lapply(multi.columns, function(x) {
+            gsub("^\\s+|\\s+$", "", x)
+        }
+    )
+    if (!is.data.frame(multi.columns) & is.list(multi.columns)) {
+        multi.columns <- do.call('cbind', multi.columns)
+      }
+    m <- if(handle.na){
+                 apply(multi.columns, 1, function(x){
+                     if (any(is.na(x))){
+                         NA
+                     } else {
+                         paste(x, collapse = sep)
+                     }
+                 }
+             )   
+         } else {
+          apply(multi.columns, 1, paste, collapse = sep)
+    }
+    names(m) <- NULL
+    return(m)
+}
+
+ability <- function(dataset, items.index, fact.score, digits = 3, full = TRUE){
+    SD <- fact.score$score.dat
+    nc <- ncol(SD)
+    ncd <- ncol(dataset)
+    IT <- SD[, -c((nc-4):nc)]
+    SD$strata <- as.factor(paste2(IT)) #the 1st paste2
+    dataset$strata <- as.factor(paste2(dataset[, items.index])) #the 2nd paste2
+    key <- c(SD$z1);names(key) <- levels(SD$strata) 
+    DF <- transform(dataset, ability=round(key[strata], digits = digits))
+    DF$strata <- NULL 
+    if (full){ 
+        return(DF)
+    } else {
+        return(DF$ability)
+    }
+}
+
+library(ltm)
+# fit1 <- rasch(modelingDataGov, constraint = cbind(length(modelingDataGov) + 1, 1))
+# summary(fit1)
+
+fit2 <- rasch(modelingDataGov)
+summary(fit2)
+# anova(fit1, fit2)
+
+fit3 <- ltm(modelingDataGov ~ z1)
+summary(fit3)
+anova(fit2, fit3) # the latent trait model fits better than rasch
+
+# fit4 <- tpm(modelingDataGov, type = "rasch", max.guessing = 1)
+# anova(fit2, fit4)
+
+fit5 <- ltm(modelingDataGov ~ z1 + z2)
+summary(fit5)
+anova(fit2, fit5)
+anova(fit3, fit5) # one variable is sufficient
+
+# Use the factor scores to create a new variable "governanceMaturity"
+fs <- factor.scores(fit3)
+modelingDataRaw <- ability(
+  dataset = modelingDataRaw,
+  items.index = 19:24, # column indices in the original data
+  fact.score = fs)
+names(modelingDataRaw)[which(names(modelingDataRaw) == "ability")] <-
+  "governanceMaturity"
+```
+
+
+## RQ3 Modeling 
+
+
+```{r}
+# The projects without commits are not interesting
+ds <- modelingDataRaw
+
+# Distribution checks pre modeling
+hist(log(ds$numCommits))
+hist(log(ds$repoAgeAtAbandonment))
+table(ds$useDepManagementTools)
+hist(log(ds$repoSize))
+hist(log(ds$totalDependencyChurn + 1))
+hist(log(ds$avgTechnicalLagDays + 1)) # bimodal
+table(ds$hasTechnicalLag)
+hist(ds$governanceMaturity)
+```
+
+### Building Model
+```{r}
+table(ds$status2Yr)
+
+frml <- status2Yr ~
+          log(numCommits + 1) +
+          log(repoAgeAtAbandonment) +
+          #log(totalNumDependencies) + # high correlation to totalDependencyChurn
+          usesDepManagementTools +
+          log(numMaintainers + 1) +
+          log(repoSize) +
+          log(totalDependencyChurn + 1) +
+          hasCorporateCommits +
+          log(avgTechnicalLagDays + 1) +
+          governanceMaturity
+
+m1 <- glm(frml,
+          family = "binomial",
+          data = ds)
+
+summary(m1)
+pR2(m1)
+vif(m1)
+```
+
+
+### Generating model summary plot
+
+```{r}
+library(tidyverse)
+library(broom)
+library(gtools)
+
+s <- summary(m1)
+coeffs <- s$coefficients %>%
+  tidy() %>%
+  filter(row_number() != 1)
+hr_labs <- data.frame(
+  cbind(round(exp(coeffs$x[,1]), 2),
+        coeffs$x[,4],
+        format.pval(pv = coeffs$x[,4],
+                    digits = 2,
+                    eps = 0.001,
+                    nsmall = 2)))
+names(hr_labs) <- c("OR", "p.val", "p.val.formatted")
+hr_labs$sig <- stars.pval(as.numeric(hr_labs$p.val))
+
+m1 %>%
+  tidy() %>%
+  filter(row_number() != 1) %>%
+  mutate(upper = estimate + 1.96 * std.error,
+         lower = estimate - 1.96 * std.error) %>%
+  mutate(across(all_of(c("estimate", "lower", "upper")), exp)) %>%
+  ggplot(aes(estimate, term, color = estimate > 1)) +
+  geom_vline(xintercept = 1, color = "gray90") +
+  geom_linerange(aes(xmin = lower, xmax = upper), size = 1.5, alpha = 0.5) +
+  geom_point(size = 4) +
+  theme_minimal() + #base_size = 16
+  scale_color_manual(values = c("#FF0000", "#00A08A"), guide = "none") +
+  xlim(c(0, 2.75)) +
+  labs(title = "Likelihood of Removing Abandoned Dependencies", y = NULL,
+       x = "Odds Ratio Estimate (***p < 0.001, **p < 0.01, *p < 0.05)") +
+  theme(axis.text.y = element_text(hjust = 0, size = 12, color = "black"), axis.title.x = element_text(hjust = 0, size = 12, color = "black")) + 
+  theme(plot.title = element_text(size=12), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(), panel.grid.major.y = element_line(color = "gray90")) +
+  geom_text(
+    label = paste0("OR = ", hr_labs[,1], hr_labs[,4]),
+    nudge_x = 0.4, nudge_y = 0.4,
+    check_overlap = T, color = "black"
+  ) + scale_y_discrete(label = c('Governance Maturity', 'Has Corporate Commits','Technical Lag (log)', 'Num Commits (log)', 'Num Maintainers (log)', 'Project Age (log)', 'Project Size (log)', 'Dependency Churn (log)', 'Uses Dep. Mgmt. Tools'))
+  # stat_pvalue_manual(stat.test, label = "p.signif", tip.length = 0.01,
+  #                    # y.position = c(1.05, 1.05, 1.05, 1.05, 1.05, 1.1),
+  #                    coord_flip = TRUE,
+  #                    # vjust = c(5, 5, 5, 5, 5, 21.5),
+  #                    hjust = -1)
+
+ggsave("visualizations/logistic.pdf", width = 7, height = 4)
+```
+
+
+
+
+
+## RQ4 Modeling 
+
+### Building Model 
+
+```{r}
+ds$statusEver <- as.numeric(ds$statusEver)
+
+res.cox <- coxph(update(frml, Surv(monthsToResponseOrCensored, statusEver) ~ . + detection), 
+             data = ds)
+
+summary(res.cox)
+
+```
+
+
+
+
+
+### Generating model summary plot
+
+```{r}
+library(survival)
+library(tidyverse)
+library(broom)
+library(gtools)
+
+s <- summary(res.cox)
+hr_labs <- data.frame(
+  cbind(round(exp(s$coefficients[,1]), 2), 
+        s$coefficients[,5],
+        format.pval(pv = s$coefficients[,5],
+                    digits = 2,
+                    eps = 0.001,
+                    nsmall = 2)))
+names(hr_labs) <- c("HR", "p.val", "p.val.formatted")
+hr_labs$sig <- stars.pval(as.numeric(hr_labs$p.val))
+
+
+res.cox %>%
+  tidy() %>%
+  mutate(upper = estimate + 1.96 * std.error,
+         lower = estimate - 1.96 * std.error) %>%
+  mutate(across(all_of(c("estimate", "lower", "upper")), exp)) %>%
+  ggplot(aes(estimate, term, color = estimate > 1)) +
+  geom_vline(xintercept = 1, color = "gray90") +
+  geom_linerange(aes(xmin = lower, xmax = upper), size = 1.5, alpha = 0.5) +
+  geom_point(size = 4) +
+  theme_minimal() + #base_size = 16
+  scale_color_manual(values = c("#FF0000", "#00A08A"), guide = "none") +
+  xlim(c(0, 2)) +
+  labs(title = "Time to Removing Abandoned Dependencies", y = NULL,
+       x = "Hazard Ratio Estimate (***p < 0.001, **p < 0.01, *p < 0.05)") +
+  theme(axis.text.y = element_text(hjust = 0, size = 12, color = "black"),axis.title.x = element_text(hjust = 0, size = 12, color = "black")) + 
+  theme(plot.title = element_text(size=12), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(), panel.grid.major.y = element_line(color = "gray90")) +
+  geom_text(
+    label = paste0("HR = ", hr_labs[,1], hr_labs[,4]), 
+    nudge_x = 0.4, nudge_y = 0.4, 
+    check_overlap = T, color = "black"
+  ) + scale_y_discrete(label = c('Detection = Explicit Notice','Governance Maturity', 'Has Corporate Commits','Technical Lag (log)', 'Num Commits (log)', 'Num Maintainers (log)', 'Project Age (log)', 'Project Size (log)', 'Dependency Churn (log)', 'Uses Dep. Mgmt. Tools'))
+  # stat_pvalue_manual(stat.test, label = "p.signif", tip.length = 0.01,
+  #                    # y.position = c(1.05, 1.05, 1.05, 1.05, 1.05, 1.1),
+  #                    coord_flip = TRUE, 
+  #                    # vjust = c(5, 5, 5, 5, 5, 21.5), 
+  #                    hjust = -1)
+
+ggsave("visualizations/survival.pdf", width = 7, height = 4)
+
+```
